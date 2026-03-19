@@ -1231,7 +1231,7 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!anchor) return [];
-        const anchorTs = anchor.createdAt.toISOString();
+        const anchorTs = sql`${anchor.createdAt.toISOString()}::timestamptz`;
         conditions.push(
           order === "asc"
             ? sql<boolean>`(
