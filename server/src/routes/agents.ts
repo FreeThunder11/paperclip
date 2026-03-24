@@ -2275,6 +2275,10 @@ export function agentRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (issue.status === "done" || issue.status === "cancelled") {
+      res.json(null);
+      return;
+    }
 
     let run = issue.executionRunId ? await heartbeat.getRun(issue.executionRunId) : null;
     if (run && run.status !== "queued" && run.status !== "running") {
