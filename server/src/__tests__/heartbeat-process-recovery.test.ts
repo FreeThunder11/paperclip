@@ -11,6 +11,7 @@ import {
   createDb,
   ensurePostgresDatabase,
   agents,
+  agentRuntimeState,
   agentWakeupRequests,
   companies,
   heartbeatRunEvents,
@@ -114,6 +115,7 @@ describe("heartbeat orphaned process recovery", () => {
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentRuntimeState);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
@@ -402,5 +404,209 @@ describe("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.errorCode).toBeNull();
     expect(run?.error).toBeNull();
+  });
+
+  it("does not reuse an issue-scoped runtime session for a no-task timer wake", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const previousRunId = randomUUID();
+    const previousWakeupRequestId = randomUUID();
+    const issueId = randomUUID();
+    const sessionId = "session-task-1";
+    const now = new Date("2026-03-19T00:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: previousWakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "claimed",
+      runId: previousRunId,
+      claimedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: previousRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: previousWakeupRequestId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+      },
+      sessionIdAfter: sessionId,
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "codex_local",
+      sessionId,
+      lastRunId: previousRunId,
+      stateJson: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      contextSnapshot: {
+        source: "scheduler",
+        reason: "interval_elapsed",
+        now: now.toISOString(),
+      },
+    });
+
+    expect(run).toBeTruthy();
+    expect(run?.sessionIdBefore).toBeNull();
+  });
+
+  it("keeps reusing a global runtime session for a no-task timer wake", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const previousRunId = randomUUID();
+    const previousWakeupRequestId = randomUUID();
+    const blockingRunId = randomUUID();
+    const blockingWakeupRequestId = randomUUID();
+    const blockingIssueId = randomUUID();
+    const sessionId = "session-global-1";
+    const now = new Date("2026-03-19T00:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: previousWakeupRequestId,
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      payload: {},
+      status: "completed",
+      runId: previousRunId,
+      claimedAt: now,
+      finishedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: previousRunId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      triggerDetail: "system",
+      status: "succeeded",
+      wakeupRequestId: previousWakeupRequestId,
+      contextSnapshot: {},
+      sessionIdAfter: sessionId,
+      startedAt: now,
+      finishedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: blockingWakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockingIssueId },
+      status: "claimed",
+      runId: blockingRunId,
+      claimedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: blockingRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: blockingWakeupRequestId,
+      contextSnapshot: {
+        issueId: blockingIssueId,
+        taskId: blockingIssueId,
+        taskKey: blockingIssueId,
+      },
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "codex_local",
+      sessionId,
+      lastRunId: previousRunId,
+      stateJson: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      contextSnapshot: {
+        source: "scheduler",
+        reason: "interval_elapsed",
+        now: now.toISOString(),
+      },
+    });
+
+    expect(run).toBeTruthy();
+    expect(run?.sessionIdBefore).toBe(sessionId);
   });
 });
