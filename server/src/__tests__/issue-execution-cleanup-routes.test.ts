@@ -4,14 +4,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 
-const AGENT_1_ID = "11111111-1111-4111-8111-111111111112";
-const AGENT_2_ID = "22222222-2222-4222-8222-222222222222";
+const ISSUE_ID = "11111111-1111-4111-8111-111111111111";
+const AGENT_1_ID = "22222222-2222-4222-8222-222222222222";
+const AGENT_2_ID = "33333333-3333-4333-8333-333333333333";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
+  release: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
+  assertCheckoutOwner: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -48,17 +51,11 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({}),
 }));
 
-function createApp() {
+function createApp(actor: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "agent",
-      agentId: AGENT_1_ID,
-      companyId: "company-1",
-      runId: "run-1",
-      companyIds: ["company-1"],
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({} as any, {} as any));
@@ -66,90 +63,105 @@ function createApp() {
   return app;
 }
 
-describe("issue self-assignment wakeup routes", () => {
+describe("issue execution cleanup routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockIssueService.addComment.mockResolvedValue(null);
+    mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAgentService.getById.mockResolvedValue({
       id: AGENT_1_ID,
       companyId: "company-1",
       role: "ceo",
       permissions: {},
     });
-    mockIssueService.addComment.mockResolvedValue(null);
-    mockIssueService.findMentionedAgents.mockResolvedValue([]);
   });
 
-  it("does not enqueue a new assignment wakeup when an agent reassigns an issue to itself", async () => {
+  it("cancels stale issue-bound runs when a board update clears execution ownership", async () => {
     mockIssueService.getById.mockResolvedValue({
-      id: "11111111-1111-4111-8111-111111111111",
+      id: ISSUE_ID,
       companyId: "company-1",
-      status: "blocked",
-      assigneeAgentId: AGENT_2_ID,
-      assigneeUserId: null,
-      identifier: "PAP-700",
-      title: "Self assignment",
-      projectId: null,
-      createdByUserId: null,
-    });
-    mockIssueService.update.mockResolvedValue({
-      id: "11111111-1111-4111-8111-111111111111",
-      companyId: "company-1",
-      status: "todo",
+      status: "in_progress",
       assigneeAgentId: AGENT_1_ID,
       assigneeUserId: null,
-      identifier: "PAP-700",
-      title: "Self assignment",
-      projectId: null,
       createdByUserId: null,
-    });
-
-    const res = await request(createApp())
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ assigneeAgentId: AGENT_1_ID, status: "todo" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    await Promise.resolve();
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  });
-
-  it("still enqueues assignment wakeups when reassigning to another agent", async () => {
-    mockIssueService.getById.mockResolvedValue({
-      id: "11111111-1111-4111-8111-111111111111",
-      companyId: "company-1",
-      status: "blocked",
-      assigneeAgentId: AGENT_1_ID,
-      assigneeUserId: null,
-      identifier: "PAP-701",
-      title: "Cross assignment",
+      identifier: "PAP-710",
+      title: "Reassign issue",
       projectId: null,
-      createdByUserId: null,
     });
     mockIssueService.update.mockResolvedValue({
-      id: "11111111-1111-4111-8111-111111111111",
+      id: ISSUE_ID,
       companyId: "company-1",
       status: "todo",
       assigneeAgentId: AGENT_2_ID,
       assigneeUserId: null,
-      identifier: "PAP-701",
-      title: "Cross assignment",
-      projectId: null,
       createdByUserId: null,
+      identifier: "PAP-710",
+      title: "Reassign issue",
+      projectId: null,
+      executionRunId: null,
+      checkoutRunId: null,
     });
 
-    const res = await request(createApp())
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+    const app = createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${ISSUE_ID}`)
       .send({ assigneeAgentId: AGENT_2_ID, status: "todo" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    await Promise.resolve();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      AGENT_2_ID,
-      expect.objectContaining({
-        source: "assignment",
-        reason: "issue_assigned",
-        payload: { issueId: "11111111-1111-4111-8111-111111111111", mutation: "update" },
-      }),
-    );
+    expect(mockHeartbeatService.cancelIssueRuns).toHaveBeenCalledWith(ISSUE_ID, {
+      reason: "Cancelled because issue execution was cleared by issue update",
+    });
+  });
+
+  it("keeps the current agent run alive while cancelling sibling issue runs on release", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: AGENT_1_ID,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-711",
+      title: "Release issue",
+      projectId: null,
+    });
+    mockIssueService.release.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-711",
+      title: "Release issue",
+      projectId: null,
+      executionRunId: null,
+      checkoutRunId: null,
+    });
+
+    const app = createApp({
+      type: "agent",
+      agentId: AGENT_1_ID,
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      runId: "run-self",
+      source: "local",
+    });
+
+    const res = await request(app).post(`/api/issues/${ISSUE_ID}/release`).send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelIssueRuns).toHaveBeenCalledWith(ISSUE_ID, {
+      excludeRunId: "run-self",
+      reason: "Cancelled because issue was released",
+    });
   });
 });

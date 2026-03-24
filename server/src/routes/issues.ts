@@ -123,6 +123,25 @@ export function issueRoutes(db: Db, storage: StorageService) {
     return null;
   }
 
+  function issueUpdateClearsExecutionState(
+    existing: {
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    },
+    update: {
+      status?: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+    },
+  ) {
+    const statusClearsExecution = update.status !== undefined && update.status !== "in_progress";
+    const assigneeChanged =
+      (update.assigneeAgentId !== undefined && update.assigneeAgentId !== existing.assigneeAgentId) ||
+      (update.assigneeUserId !== undefined && update.assigneeUserId !== existing.assigneeUserId);
+    return statusClearsExecution || assigneeChanged;
+  }
+
   async function assertAgentRunCheckoutOwnership(
     req: Request,
     res: Response,
@@ -865,7 +884,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    const clearsExecutionState = issueUpdateClearsExecutionState(existing, updateFields);
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    if (clearsExecutionState) {
+      await heartbeat.cancelIssueRuns(
+        issue.id,
+        actor.runId
+          ? {
+            excludeRunId: actor.runId,
+            reason: "Cancelled because issue execution was cleared by issue update",
+          }
+          : {
+            reason: "Cancelled because issue execution was cleared by issue update",
+          },
+      );
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
@@ -1147,6 +1181,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+    await heartbeat.cancelIssueRuns(
+      released.id,
+      actor.runId
+        ? {
+          excludeRunId: actor.runId,
+          reason: "Cancelled because issue was released",
+        }
+        : {
+          reason: "Cancelled because issue was released",
+        },
+    );
+
     await logActivity(db, {
       companyId: released.companyId,
       actorType: actor.actorType,
