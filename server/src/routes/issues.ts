@@ -35,7 +35,7 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { queueIssueAssignmentWakeup, shouldWakeAssigneeOnAssignment } from "../services/issue-assignment-wakeup.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 
@@ -121,6 +121,25 @@ export function issueRoutes(db: Db, storage: StorageService) {
     if (runId) return runId;
     res.status(401).json({ error: "Agent run id required" });
     return null;
+  }
+
+  function issueUpdateClearsExecutionState(
+    existing: {
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    },
+    update: {
+      status?: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+    },
+  ) {
+    const statusClearsExecution = update.status !== undefined && update.status !== "in_progress";
+    const assigneeChanged =
+      (update.assigneeAgentId !== undefined && update.assigneeAgentId !== existing.assigneeAgentId) ||
+      (update.assigneeUserId !== undefined && update.assigneeUserId !== existing.assigneeUserId);
+    return statusClearsExecution || assigneeChanged;
   }
 
   async function assertAgentRunCheckoutOwnership(
@@ -791,6 +810,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       contextSource: "issue.create",
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
+      requestedByRunId: actor.runId,
     });
 
     res.status(201).json(issue);
@@ -864,7 +884,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    const clearsExecutionState = issueUpdateClearsExecutionState(existing, updateFields);
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    if (clearsExecutionState) {
+      await heartbeat.cancelIssueRuns(
+        issue.id,
+        actor.runId
+          ? {
+            excludeRunId: actor.runId,
+            reason: "Cancelled because issue execution was cleared by issue update",
+          }
+          : {
+            reason: "Cancelled because issue execution was cleared by issue update",
+          },
+      );
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
@@ -942,9 +977,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+      const issueAssigneeAgentId = issue.assigneeAgentId;
 
-      if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
-        wakeups.set(issue.assigneeAgentId, {
+      const shouldWakeIssueAssignee = shouldWakeAssigneeOnAssignment({
+        actorType: actor.actorType,
+        actorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        actorRunId: actor.runId ?? null,
+        assigneeAgentId: issueAssigneeAgentId,
+        status: issue.status,
+      });
+
+      if (assigneeChanged && shouldWakeIssueAssignee && issueAssigneeAgentId) {
+        wakeups.set(issueAssigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_assigned",
@@ -955,8 +999,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
       }
 
-      if (!assigneeChanged && statusChangedFromBacklog && issue.assigneeAgentId) {
-        wakeups.set(issue.assigneeAgentId, {
+      if (!assigneeChanged && statusChangedFromBacklog && shouldWakeIssueAssignee && issueAssigneeAgentId) {
+        wakeups.set(issueAssigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
           reason: "issue_status_changed",
@@ -1137,6 +1181,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+    await heartbeat.cancelIssueRuns(
+      released.id,
+      actor.runId
+        ? {
+          excludeRunId: actor.runId,
+          reason: "Cancelled because issue was released",
+        }
+        : {
+          reason: "Cancelled because issue was released",
+        },
+    );
+
     await logActivity(db, {
       companyId: released.companyId,
       actorType: actor.actorType,

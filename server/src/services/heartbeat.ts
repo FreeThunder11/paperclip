@@ -3143,6 +3143,8 @@ export function heartbeatService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
           })
@@ -3191,13 +3193,14 @@ export function heartbeatService(db: Db) {
             .where(eq(issues.id, issue.id));
         }
 
-        if (!activeExecutionRun) {
+        if (!activeExecutionRun && issue.status === "in_progress" && issue.assigneeAgentId) {
           const legacyRun = await tx
             .select()
             .from(heartbeatRuns)
             .where(
               and(
                 eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.agentId, issue.assigneeAgentId),
                 inArray(heartbeatRuns.status, ["queued", "running"]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
               ),
@@ -3665,6 +3668,35 @@ export function heartbeatService(db: Db) {
     return cancelled;
   }
 
+  async function cancelIssueRunsInternal(
+    issueId: string,
+    opts?: {
+      excludeRunId?: string | null;
+      reason?: string;
+    },
+  ) {
+    const liveRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      );
+
+    let cancelled = 0;
+    for (const run of liveRuns) {
+      if (opts?.excludeRunId && run.id === opts.excludeRunId) continue;
+      await cancelRunInternal(run.id, opts?.reason ?? "Cancelled because issue execution was cleared");
+      cancelled += 1;
+    }
+
+    return cancelled;
+  }
+
   async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause") {
     const runs = await db
       .select()
@@ -3897,6 +3929,14 @@ export function heartbeatService(db: Db) {
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    cancelIssueRuns: (
+      issueId: string,
+      opts?: {
+        excludeRunId?: string | null;
+        reason?: string;
+      },
+    ) => cancelIssueRunsInternal(issueId, opts),
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 

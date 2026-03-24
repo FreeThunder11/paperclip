@@ -21,6 +21,10 @@ interface RunningProcess {
   graceSec: number;
 }
 
+type RunningProcessesGlobal = typeof globalThis & {
+  __paperclipRunningProcesses__?: Map<string, RunningProcess>;
+};
+
 interface SpawnTarget {
   command: string;
   args: string[];
@@ -34,7 +38,15 @@ type ChildProcessWithEvents = ChildProcess & {
   ): ChildProcess;
 };
 
-export const runningProcesses = new Map<string, RunningProcess>();
+function getRunningProcessesRegistry(): Map<string, RunningProcess> {
+  const globalRegistry = globalThis as RunningProcessesGlobal;
+  if (!globalRegistry.__paperclipRunningProcesses__) {
+    globalRegistry.__paperclipRunningProcesses__ = new Map<string, RunningProcess>();
+  }
+  return globalRegistry.__paperclipRunningProcesses__;
+}
+
+export const runningProcesses = getRunningProcessesRegistry();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
