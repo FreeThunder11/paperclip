@@ -2,6 +2,20 @@ import { logger } from "../middleware/logger.js";
 
 type WakeupTriggerDetail = "manual" | "ping" | "callback" | "system";
 type WakeupSource = "timer" | "assignment" | "on_demand" | "automation";
+type AssignmentWakeActorType = "user" | "agent" | "system";
+
+export function shouldWakeAssigneeOnAssignment(input: {
+  actorType?: AssignmentWakeActorType;
+  actorAgentId?: string | null;
+  actorRunId?: string | null;
+  assigneeAgentId: string | null;
+  status: string;
+}) {
+  if (!input.assigneeAgentId || input.status === "backlog") return false;
+  if ((input.actorType ?? "system") !== "agent") return true;
+  if (!input.actorAgentId || !input.actorRunId) return true;
+  return input.actorAgentId !== input.assigneeAgentId;
+}
 
 export interface IssueAssignmentWakeupDeps {
   wakeup: (
@@ -26,12 +40,31 @@ export function queueIssueAssignmentWakeup(input: {
   contextSource: string;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  requestedByRunId?: string | null;
   rethrowOnError?: boolean;
 }) {
-  if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
+  const actorType = input.requestedByActorType ?? "system";
+  const actorAgentId = actorType === "agent" ? input.requestedByActorId ?? null : null;
+  const actorRunId = input.requestedByRunId ?? null;
+  const assigneeAgentId = input.issue.assigneeAgentId;
+  if (
+    !shouldWakeAssigneeOnAssignment({
+      actorType,
+      actorAgentId,
+      actorRunId,
+      assigneeAgentId,
+      status: input.issue.status,
+    })
+  ) {
+    return;
+  }
+
+  if (!assigneeAgentId) {
+    return;
+  }
 
   return input.heartbeat
-    .wakeup(input.issue.assigneeAgentId, {
+    .wakeup(assigneeAgentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: input.reason,

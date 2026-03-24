@@ -35,7 +35,7 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { queueIssueAssignmentWakeup, shouldWakeAssigneeOnAssignment } from "../services/issue-assignment-wakeup.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 
@@ -791,6 +791,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       contextSource: "issue.create",
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
+      requestedByRunId: actor.runId,
     });
 
     res.status(201).json(issue);
@@ -942,9 +943,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+      const issueAssigneeAgentId = issue.assigneeAgentId;
 
-      if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
-        wakeups.set(issue.assigneeAgentId, {
+      const shouldWakeIssueAssignee = shouldWakeAssigneeOnAssignment({
+        actorType: actor.actorType,
+        actorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        actorRunId: actor.runId ?? null,
+        assigneeAgentId: issueAssigneeAgentId,
+        status: issue.status,
+      });
+
+      if (assigneeChanged && shouldWakeIssueAssignee && issueAssigneeAgentId) {
+        wakeups.set(issueAssigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_assigned",
@@ -955,8 +965,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
       }
 
-      if (!assigneeChanged && statusChangedFromBacklog && issue.assigneeAgentId) {
-        wakeups.set(issue.assigneeAgentId, {
+      if (!assigneeChanged && statusChangedFromBacklog && shouldWakeIssueAssignee && issueAssigneeAgentId) {
+        wakeups.set(issueAssigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
           reason: "issue_status_changed",
