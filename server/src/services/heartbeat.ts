@@ -1036,7 +1036,19 @@ export function heartbeatService(db: Db) {
     }
 
     const runtimeForRun = await getRuntimeState(agent.id);
-    return runtimeForRun?.sessionId ?? null;
+    const runtimeSessionId = readNonEmptyString(runtimeForRun?.sessionId);
+    if (!runtimeSessionId) return null;
+
+    // Guard against detached timer wakes inheriting the last issue-scoped session
+    // after the control plane has already cleared task ownership.
+    if (!taskKey) {
+      const lastRunId = readNonEmptyString(runtimeForRun?.lastRunId);
+      if (!lastRunId) return null;
+      const lastRun = await getRun(lastRunId);
+      if (!lastRun || runTaskKey(lastRun)) return null;
+    }
+
+    return runtimeSessionId;
   }
 
   async function resolveExplicitResumeSessionOverride(
@@ -2351,7 +2363,8 @@ export function heartbeatService(db: Db) {
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
-    const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
+    const runtimeSessionFallback =
+      taskKey || resetTaskSession ? null : readNonEmptyString(run.sessionIdBefore);
     let previousSessionDisplayId = truncateDisplayId(
       explicitResumeSessionDisplayId ??
         taskSessionForRun?.sessionDisplayId ??
