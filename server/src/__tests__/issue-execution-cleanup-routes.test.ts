@@ -28,6 +28,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   cancelIssueRuns: vi.fn(async () => 0),
 }));
 
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  archiveWithCleanup: vi.fn(),
+}));
+
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
@@ -38,7 +43,7 @@ vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
   agentService: () => mockAgentService,
   documentService: () => ({}),
-  executionWorkspaceService: () => ({}),
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
   goalService: () => ({}),
   heartbeatService: () => mockHeartbeatService,
   issueApprovalService: () => ({}),
@@ -69,6 +74,13 @@ describe("issue execution cleanup routes", () => {
     mockIssueService.addComment.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockExecutionWorkspaceService.archiveWithCleanup.mockResolvedValue({
+      workspace: null,
+      cleanupWarnings: [],
+      blockedByActiveIssues: [],
+      cleaned: true,
+    });
     mockAgentService.getById.mockResolvedValue({
       id: AGENT_1_ID,
       companyId: "company-1",
@@ -163,5 +175,117 @@ describe("issue execution cleanup routes", () => {
       excludeRunId: "run-self",
       reason: "Cancelled because issue was released",
     });
+  });
+
+  it("auto-archives runtime issue-scoped git worktrees when an issue first closes", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: AGENT_1_ID,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-712",
+      title: "Close issue",
+      projectId: null,
+      executionWorkspaceId: "workspace-1",
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "done",
+      assigneeAgentId: AGENT_1_ID,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-712",
+      title: "Close issue",
+      projectId: null,
+      executionWorkspaceId: "workspace-1",
+      executionRunId: null,
+      checkoutRunId: null,
+    });
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      status: "active",
+      providerType: "git_worktree",
+      sourceIssueId: ISSUE_ID,
+      metadata: { createdByRuntime: true },
+    });
+
+    const app = createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockExecutionWorkspaceService.getById).toHaveBeenCalledWith("workspace-1");
+    expect(mockExecutionWorkspaceService.archiveWithCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "workspace-1",
+        providerType: "git_worktree",
+        sourceIssueId: ISSUE_ID,
+      }),
+    );
+  });
+
+  it("skips auto-archive when the workspace is not a runtime-created issue-scoped git worktree", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: AGENT_1_ID,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-713",
+      title: "Close shared workspace issue",
+      projectId: null,
+      executionWorkspaceId: "workspace-2",
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: ISSUE_ID,
+      companyId: "company-1",
+      status: "done",
+      assigneeAgentId: AGENT_1_ID,
+      assigneeUserId: null,
+      createdByUserId: null,
+      identifier: "PAP-713",
+      title: "Close shared workspace issue",
+      projectId: null,
+      executionWorkspaceId: "workspace-2",
+      executionRunId: null,
+      checkoutRunId: null,
+    });
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-2",
+      companyId: "company-1",
+      status: "active",
+      providerType: "local_fs",
+      sourceIssueId: ISSUE_ID,
+      metadata: { createdByRuntime: true },
+    });
+
+    const app = createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockExecutionWorkspaceService.getById).toHaveBeenCalledWith("workspace-2");
+    expect(mockExecutionWorkspaceService.archiveWithCleanup).not.toHaveBeenCalled();
   });
 });
