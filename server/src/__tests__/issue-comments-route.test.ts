@@ -19,6 +19,7 @@ const mockIssueApprovalService = vi.hoisted(() => ({}));
 const mockDocumentService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockProjectService = vi.hoisted(() => ({}));
+const mockRoutineService = vi.hoisted(() => ({}));
 const mockWorkProductService = vi.hoisted(() => ({}));
 
 vi.mock("../services/index.js", () => ({
@@ -32,6 +33,7 @@ vi.mock("../services/index.js", () => ({
   documentService: () => mockDocumentService,
   logActivity: mockLogActivity,
   projectService: () => mockProjectService,
+  routineService: () => mockRoutineService,
   workProductService: () => mockWorkProductService,
 }));
 
