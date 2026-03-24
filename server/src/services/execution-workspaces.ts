@@ -1,9 +1,21 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces } from "@paperclipai/db";
+import { executionWorkspaces, issues, projects, projectWorkspaces } from "@paperclipai/db";
 import type { ExecutionWorkspace } from "@paperclipai/shared";
+import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import { workspaceOperationService } from "./workspace-operations.js";
+import {
+  cleanupExecutionWorkspaceArtifacts,
+  stopRuntimeServicesForExecutionWorkspace,
+} from "./workspace-runtime.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
+type LinkedIssueRef = {
+  id: string;
+  status: string;
+};
+
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 function toExecutionWorkspace(row: ExecutionWorkspaceRow): ExecutionWorkspace {
   return {
@@ -35,6 +47,8 @@ function toExecutionWorkspace(row: ExecutionWorkspaceRow): ExecutionWorkspace {
 }
 
 export function executionWorkspaceService(db: Db) {
+  const workspaceOperationsSvc = workspaceOperationService(db);
+
   return {
     list: async (companyId: string, filters?: {
       projectId?: string;
@@ -92,6 +106,146 @@ export function executionWorkspaceService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;
+    },
+
+    archiveWithCleanup: async (
+      existing: ExecutionWorkspace,
+      patch: Partial<typeof executionWorkspaces.$inferInsert> = {},
+    ): Promise<{
+      workspace: ExecutionWorkspace | null;
+      cleanupWarnings: string[];
+      blockedByActiveIssues: LinkedIssueRef[];
+      cleaned: boolean | null;
+    }> => {
+      const linkedIssues = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, existing.companyId), eq(issues.executionWorkspaceId, existing.id)));
+      const blockedByActiveIssues = linkedIssues.filter((issue) => !TERMINAL_ISSUE_STATUSES.has(issue.status));
+
+      if (blockedByActiveIssues.length > 0) {
+        return {
+          workspace: existing,
+          cleanupWarnings: [],
+          blockedByActiveIssues,
+          cleaned: null,
+        };
+      }
+
+      const closedAt = new Date();
+      const archivedWorkspace = await db
+        .update(executionWorkspaces)
+        .set({
+          ...patch,
+          status: "archived",
+          closedAt,
+          cleanupReason: null,
+          updatedAt: closedAt,
+        })
+        .where(eq(executionWorkspaces.id, existing.id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!archivedWorkspace) {
+        return {
+          workspace: null,
+          cleanupWarnings: [],
+          blockedByActiveIssues: [],
+          cleaned: null,
+        };
+      }
+
+      let workspace = toExecutionWorkspace(archivedWorkspace);
+
+      try {
+        await stopRuntimeServicesForExecutionWorkspace({
+          db,
+          executionWorkspaceId: existing.id,
+          workspaceCwd: existing.cwd,
+        });
+
+        const projectWorkspace = existing.projectWorkspaceId
+          ? await db
+              .select({
+                cwd: projectWorkspaces.cwd,
+                cleanupCommand: projectWorkspaces.cleanupCommand,
+              })
+              .from(projectWorkspaces)
+              .where(
+                and(
+                  eq(projectWorkspaces.id, existing.projectWorkspaceId),
+                  eq(projectWorkspaces.companyId, existing.companyId),
+                ),
+              )
+              .then((rows) => rows[0] ?? null)
+          : null;
+
+        const projectPolicy = existing.projectId
+          ? await db
+              .select({
+                executionWorkspacePolicy: projects.executionWorkspacePolicy,
+              })
+              .from(projects)
+              .where(and(eq(projects.id, existing.projectId), eq(projects.companyId, existing.companyId)))
+              .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy))
+          : null;
+
+        const cleanupResult = await cleanupExecutionWorkspaceArtifacts({
+          workspace: existing,
+          projectWorkspace,
+          teardownCommand: projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+          recorder: workspaceOperationsSvc.createRecorder({
+            companyId: existing.companyId,
+            executionWorkspaceId: existing.id,
+          }),
+        });
+
+        const cleanupPatch: Partial<typeof executionWorkspaces.$inferInsert> = {
+          closedAt,
+          cleanupReason: cleanupResult.warnings.length > 0 ? cleanupResult.warnings.join(" | ") : null,
+        };
+        if (!cleanupResult.cleaned) {
+          cleanupPatch.status = "cleanup_failed";
+        }
+        if (cleanupResult.warnings.length > 0 || !cleanupResult.cleaned) {
+          workspace = (await db
+            .update(executionWorkspaces)
+            .set({
+              ...cleanupPatch,
+              updatedAt: new Date(),
+            })
+            .where(eq(executionWorkspaces.id, existing.id))
+            .returning()
+            .then((rows) => rows[0] ?? null)
+            .then((row) => (row ? toExecutionWorkspace(row) : workspace))) ?? workspace;
+        }
+
+        return {
+          workspace,
+          cleanupWarnings: cleanupResult.warnings,
+          blockedByActiveIssues: [],
+          cleaned: cleanupResult.cleaned,
+        };
+      } catch (error) {
+        const failureReason = error instanceof Error ? error.message : String(error);
+        workspace =
+          (await db
+            .update(executionWorkspaces)
+            .set({
+              status: "cleanup_failed",
+              closedAt,
+              cleanupReason: failureReason,
+              updatedAt: new Date(),
+            })
+            .where(eq(executionWorkspaces.id, existing.id))
+            .returning()
+            .then((rows) => rows[0] ?? null)
+            .then((row) => (row ? toExecutionWorkspace(row) : workspace))) ?? workspace;
+        throw new Error(`Failed to archive execution workspace: ${failureReason}`);
+      }
     },
   };
 }

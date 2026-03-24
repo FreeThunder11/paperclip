@@ -38,6 +38,7 @@ import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.
 import { queueIssueAssignmentWakeup, shouldWakeAssigneeOnAssignment } from "../services/issue-assignment-wakeup.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
@@ -140,6 +141,51 @@ export function issueRoutes(db: Db, storage: StorageService) {
       (update.assigneeAgentId !== undefined && update.assigneeAgentId !== existing.assigneeAgentId) ||
       (update.assigneeUserId !== undefined && update.assigneeUserId !== existing.assigneeUserId);
     return statusClearsExecution || assigneeChanged;
+  }
+
+  async function maybeArchiveRuntimeIssueWorkspaceOnTerminalClose(issue: {
+    id: string;
+    identifier: string | null;
+    status: string;
+    executionWorkspaceId?: string | null;
+  }) {
+    if (!TERMINAL_ISSUE_STATUSES.has(issue.status)) return;
+    if (!issue.executionWorkspaceId) return;
+
+    const workspace = await executionWorkspacesSvc.getById(issue.executionWorkspaceId);
+    if (!workspace || workspace.status === "archived") return;
+
+    const createdByRuntime = workspace.metadata?.createdByRuntime === true;
+    const isIssueScopedWorkspace = workspace.sourceIssueId === issue.id;
+    const isRuntimeGitWorktree = workspace.providerType === "git_worktree";
+    if (!createdByRuntime || !isIssueScopedWorkspace || !isRuntimeGitWorktree) return;
+
+    try {
+      const archiveResult = await executionWorkspacesSvc.archiveWithCleanup(workspace);
+      if (archiveResult.blockedByActiveIssues.length > 0 || archiveResult.cleanupWarnings.length > 0 || !archiveResult.cleaned) {
+        logger.info(
+          {
+            issueId: issue.id,
+            issueIdentifier: issue.identifier ?? issue.id,
+            executionWorkspaceId: workspace.id,
+            blockedByActiveIssues: archiveResult.blockedByActiveIssues.map((linkedIssue) => linkedIssue.id),
+            cleanupWarnings: archiveResult.cleanupWarnings,
+            cleaned: archiveResult.cleaned,
+          },
+          "terminal issue closeout completed without fully archiving execution workspace",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        {
+          issueId: issue.id,
+          issueIdentifier: issue.identifier ?? issue.id,
+          executionWorkspaceId: workspace.id,
+          err,
+        },
+        "failed to auto-archive runtime execution workspace after terminal issue closeout",
+      );
+    }
   }
 
   async function assertAgentRunCheckoutOwnership(
@@ -904,6 +950,11 @@ export function issueRoutes(db: Db, storage: StorageService) {
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue activity"));
+    }
+
+    const transitionedToTerminal = !isClosed && TERMINAL_ISSUE_STATUSES.has(issue.status);
+    if (transitionedToTerminal) {
+      await maybeArchiveRuntimeIssueWorkspaceOnTerminalClose(issue);
     }
 
     // Build activity details with previous values for changed fields
