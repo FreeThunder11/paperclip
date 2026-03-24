@@ -133,8 +133,12 @@ describe("heartbeat orphaned process recovery", () => {
 
   async function seedRunFixture(input?: {
     adapterType?: string;
+    adapterConfig?: Record<string, unknown>;
+    invocationSource?: "assignment" | "timer";
+    wakeupReason?: "issue_assigned" | "heartbeat_timer";
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
+    processStartedAt?: Date;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -147,6 +151,9 @@ describe("heartbeat orphaned process recovery", () => {
     const issueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const invocationSource = input?.invocationSource ?? "assignment";
+    const wakeupReason =
+      input?.wakeupReason ?? (invocationSource === "timer" ? "heartbeat_timer" : "issue_assigned");
 
     await db.insert(companies).values({
       id: companyId,
@@ -162,7 +169,7 @@ describe("heartbeat orphaned process recovery", () => {
       role: "engineer",
       status: "paused",
       adapterType: input?.adapterType ?? "codex_local",
-      adapterConfig: {},
+      adapterConfig: input?.adapterConfig ?? {},
       runtimeConfig: {},
       permissions: {},
     });
@@ -171,9 +178,9 @@ describe("heartbeat orphaned process recovery", () => {
       id: wakeupRequestId,
       companyId,
       agentId,
-      source: "assignment",
+      source: invocationSource,
       triggerDetail: "system",
-      reason: "issue_assigned",
+      reason: wakeupReason,
       payload: input?.includeIssue === false ? {} : { issueId },
       status: "claimed",
       runId,
@@ -184,7 +191,7 @@ describe("heartbeat orphaned process recovery", () => {
       id: runId,
       companyId,
       agentId,
-      invocationSource: "assignment",
+      invocationSource,
       triggerDetail: "system",
       status: input?.runStatus ?? "running",
       wakeupRequestId,
@@ -193,6 +200,7 @@ describe("heartbeat orphaned process recovery", () => {
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
       startedAt: now,
       updatedAt: new Date("2026-03-19T00:00:00.000Z"),
     });
@@ -240,6 +248,83 @@ describe("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("times out a detached local child after it exceeds the configured timeout budget", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId, wakeupRequestId, issueId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      adapterConfig: {
+        timeoutSec: 60,
+        graceSec: 5,
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("timed_out");
+    expect(run?.errorCode).toBe("timeout");
+    expect(run?.finishedAt).toBeTruthy();
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("timed_out");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.executionLockedAt).toBeNull();
+    expect(issue?.checkoutRunId).toBe(runId);
+  });
+
+  it("times out a detached no-issue timer run after it exceeds the configured timeout budget", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      invocationSource: "timer",
+      wakeupReason: "heartbeat_timer",
+      includeIssue: false,
+      processPid: child.pid ?? null,
+      processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      adapterConfig: {
+        timeoutSec: 60,
+        graceSec: 5,
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("timed_out");
+    expect(run?.errorCode).toBe("timeout");
+    expect(run?.finishedAt).toBeTruthy();
+    expect(run?.contextSnapshot).toEqual({});
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("timed_out");
   });
 
   it("queues exactly one retry when the recorded local pid is dead", async () => {
