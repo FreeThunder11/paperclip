@@ -63,6 +63,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const DETACHED_PROCESS_TIMEOUT_BUFFER_MS = 5_000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -668,6 +669,21 @@ function isProcessAlive(pid: number | null | undefined) {
     if (code === "ESRCH") return false;
     return false;
   }
+}
+
+function detachedProcessTimeoutBudgetMs(adapterConfig: unknown) {
+  const config = parseObject(adapterConfig);
+  const timeoutSec = asNumber(config.timeoutSec, 0);
+  if (timeoutSec <= 0) return null;
+  const graceSec = Math.max(1, asNumber(config.graceSec, 15));
+  return timeoutSec * 1000 + graceSec * 1000 + DETACHED_PROCESS_TIMEOUT_BUFFER_MS;
+}
+
+function detachedProcessAgeMs(run: typeof heartbeatRuns.$inferSelect, now: Date) {
+  const baseline = run.processStartedAt ?? run.startedAt ?? run.updatedAt ?? null;
+  if (!(baseline instanceof Date)) return null;
+  const ageMs = now.getTime() - baseline.getTime();
+  return ageMs >= 0 ? ageMs : null;
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -1738,6 +1754,7 @@ export function heartbeatService(db: Db) {
       .select({
         run: heartbeatRuns,
         adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -1745,7 +1762,7 @@ export function heartbeatService(db: Db) {
 
     const reaped: string[] = [];
 
-    for (const { run, adapterType } of activeRuns) {
+    for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -1756,6 +1773,47 @@ export function heartbeatService(db: Db) {
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       if (tracksLocalChild && run.processPid && isProcessAlive(run.processPid)) {
+        const timeoutBudgetMs = detachedProcessTimeoutBudgetMs(adapterConfig);
+        const processAgeMs = detachedProcessAgeMs(run, now);
+        const timedOutDetachedProcess =
+          timeoutBudgetMs != null && processAgeMs != null && processAgeMs > timeoutBudgetMs;
+
+        if (timedOutDetachedProcess) {
+          const timeoutMessage =
+            `Detached child pid ${run.processPid} exceeded timeout budget and can no longer keep run active`;
+
+          let finalizedRun = await setRunStatus(run.id, "timed_out", {
+            error: timeoutMessage,
+            errorCode: "timeout",
+            finishedAt: now,
+          });
+          await setWakeupStatus(run.wakeupRequestId, "timed_out", {
+            finishedAt: now,
+            error: timeoutMessage,
+          });
+          if (!finalizedRun) finalizedRun = await getRun(run.id);
+          if (!finalizedRun) continue;
+
+          await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "error",
+            message: timeoutMessage,
+            payload: {
+              processPid: run.processPid,
+              processAgeMs,
+              timeoutBudgetMs,
+            },
+          });
+
+          await releaseIssueExecutionAndPromote(finalizedRun);
+          await finalizeAgentStatus(run.agentId, "timed_out");
+          await startNextQueuedRunForAgent(run.agentId);
+          runningProcesses.delete(run.id);
+          reaped.push(run.id);
+          continue;
+        }
+
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
