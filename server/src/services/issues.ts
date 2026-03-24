@@ -33,6 +33,7 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getDefaultCompanyGoal } from "./goals.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 
 function assertTransition(from: string, to: string) {
@@ -57,6 +58,16 @@ function applyStatusSideEffects(
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
   }
+  return patch;
+}
+
+function clearIssueExecutionState(
+  patch: Partial<typeof issues.$inferInsert>,
+): Partial<typeof issues.$inferInsert> {
+  patch.checkoutRunId = null;
+  patch.executionRunId = null;
+  patch.executionAgentNameKey = null;
+  patch.executionLockedAt = null;
   return patch;
 }
 
@@ -884,13 +895,13 @@ export function issueService(db: Db) {
         patch.cancelledAt = null;
       }
       if (issueData.status && issueData.status !== "in_progress") {
-        patch.checkoutRunId = null;
+        clearIssueExecutionState(patch);
       }
       if (
         (issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== existing.assigneeAgentId) ||
         (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== existing.assigneeUserId)
       ) {
-        patch.checkoutRunId = null;
+        clearIssueExecutionState(patch);
       }
 
       return db.transaction(async (tx) => {
@@ -1159,12 +1170,19 @@ export function issueService(db: Db) {
         });
       }
 
+      const nextStatus = TERMINAL_ISSUE_STATUSES.has(existing.status) ? existing.status : "todo";
       const updated = await db
         .update(issues)
         .set({
-          status: "todo",
+          status: nextStatus,
           assigneeAgentId: null,
+          assigneeUserId: null,
           checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: nextStatus === "done" ? (existing.completedAt ?? new Date()) : null,
+          cancelledAt: nextStatus === "cancelled" ? (existing.cancelledAt ?? new Date()) : null,
           updatedAt: new Date(),
         })
         .where(eq(issues.id, id))
@@ -1231,15 +1249,16 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!anchor) return [];
+        const anchorTs = sql`${anchor.createdAt.toISOString()}::timestamptz`;
         conditions.push(
           order === "asc"
             ? sql<boolean>`(
-                ${issueComments.createdAt} > ${anchor.createdAt}
-                OR (${issueComments.createdAt} = ${anchor.createdAt} AND ${issueComments.id} > ${anchor.id})
+                ${issueComments.createdAt} > ${anchorTs}
+                OR (${issueComments.createdAt} = ${anchorTs} AND ${issueComments.id} > ${anchor.id})
               )`
             : sql<boolean>`(
-                ${issueComments.createdAt} < ${anchor.createdAt}
-                OR (${issueComments.createdAt} = ${anchor.createdAt} AND ${issueComments.id} < ${anchor.id})
+                ${issueComments.createdAt} < ${anchorTs}
+                OR (${issueComments.createdAt} = ${anchorTs} AND ${issueComments.id} < ${anchor.id})
               )`,
         );
       }
