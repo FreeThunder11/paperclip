@@ -7,6 +7,7 @@ import {
   formatRuntimeWorkspaceWarningLog,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
+  resolveQueuedNoTaskSessionFallback,
   resolveRuntimeSessionParamsForWorkspace,
   shouldResetTaskSessionForWake,
   type ResolvedWorkspaceForRun,
@@ -231,6 +232,37 @@ describe("buildExplicitResumeSessionOverride", () => {
       sessionParams: {
         sessionId: "session-after",
       },
+    });
+  });
+});
+
+describe("resolveQueuedNoTaskSessionFallback", () => {
+  it("drops a queued no-task fallback session when it originated from task scope", () => {
+    expect(
+      resolveQueuedNoTaskSessionFallback({
+        taskKey: null,
+        resetTaskSession: false,
+        runSessionIdBefore: "session-task-1",
+        fallbackSessionSourceTaskKey: "issue-123",
+      }),
+    ).toEqual({
+      sessionId: null,
+      warning:
+        'Skipping queued no-task session fallback "session-task-1" because it originated from task "issue-123".',
+    });
+  });
+
+  it("keeps a queued no-task fallback session when its source is already global", () => {
+    expect(
+      resolveQueuedNoTaskSessionFallback({
+        taskKey: null,
+        resetTaskSession: false,
+        runSessionIdBefore: "session-global-1",
+        fallbackSessionSourceTaskKey: null,
+      }),
+    ).toEqual({
+      sessionId: "session-global-1",
+      warning: null,
     });
   });
 });

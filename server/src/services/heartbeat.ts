@@ -691,6 +691,33 @@ function truncateDisplayId(value: string | null | undefined, max = 128) {
   return value.length > max ? value.slice(0, max) : value;
 }
 
+export function resolveQueuedNoTaskSessionFallback(input: {
+  taskKey: string | null;
+  resetTaskSession: boolean;
+  runSessionIdBefore: string | null;
+  fallbackSessionSourceTaskKey: string | null;
+}) {
+  if (input.taskKey || input.resetTaskSession) {
+    return { sessionId: null, warning: null };
+  }
+
+  const sessionId = readNonEmptyString(input.runSessionIdBefore);
+  if (!sessionId) {
+    return { sessionId: null, warning: null };
+  }
+
+  if (input.fallbackSessionSourceTaskKey) {
+    return {
+      sessionId: null,
+      warning:
+        `Skipping queued no-task session fallback "${truncateDisplayId(sessionId)}" ` +
+        `because it originated from task "${input.fallbackSessionSourceTaskKey}".`,
+    };
+  }
+
+  return { sessionId, warning: null };
+}
+
 function normalizeAgentNameKey(value: string | null | undefined) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
@@ -2317,10 +2344,25 @@ export function heartbeatService(db: Db) {
       },
     });
     const runtimeSessionParams = runtimeSessionResolution.sessionParams;
+    const queuedNoTaskSessionId =
+      !taskKey && !resetTaskSession ? readNonEmptyString(run.sessionIdBefore) : null;
+    const queuedNoTaskSessionSourceRun =
+      queuedNoTaskSessionId
+        ? await getLatestRunForSession(agent.id, queuedNoTaskSessionId, { excludeRunId: run.id })
+        : null;
+    const queuedNoTaskSessionFallback = resolveQueuedNoTaskSessionFallback({
+      taskKey,
+      resetTaskSession,
+      runSessionIdBefore: queuedNoTaskSessionId,
+      fallbackSessionSourceTaskKey: queuedNoTaskSessionSourceRun
+        ? runTaskKey(queuedNoTaskSessionSourceRun)
+        : null,
+    });
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
       ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
+      ...(queuedNoTaskSessionFallback.warning ? [queuedNoTaskSessionFallback.warning] : []),
       ...(resetTaskSession && sessionResetReason
         ? [
             taskKey
@@ -2363,8 +2405,7 @@ export function heartbeatService(db: Db) {
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
-    const runtimeSessionFallback =
-      taskKey || resetTaskSession ? null : readNonEmptyString(run.sessionIdBefore);
+    const runtimeSessionFallback = queuedNoTaskSessionFallback.sessionId;
     let previousSessionDisplayId = truncateDisplayId(
       explicitResumeSessionDisplayId ??
         taskSessionForRun?.sessionDisplayId ??
