@@ -243,7 +243,7 @@ describe("resolveQueuedNoTaskSessionFallback", () => {
         taskKey: null,
         resetTaskSession: false,
         runSessionIdBefore: "session-task-1",
-        fallbackSessionSourceTaskKey: "issue-123",
+        fallbackSessionOriginTaskKey: "issue-123",
       }),
     ).toEqual({
       sessionId: null,
@@ -258,7 +258,7 @@ describe("resolveQueuedNoTaskSessionFallback", () => {
         taskKey: null,
         resetTaskSession: false,
         runSessionIdBefore: "session-global-1",
-        fallbackSessionSourceTaskKey: null,
+        fallbackSessionOriginTaskKey: null,
       }),
     ).toEqual({
       sessionId: "session-global-1",
