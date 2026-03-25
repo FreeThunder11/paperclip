@@ -893,15 +893,17 @@ export function heartbeatService(db: Db) {
 
   async function getOldestRunForSession(agentId: string, sessionId: string) {
     return db
-      .select({
-        id: heartbeatRuns.id,
-        createdAt: heartbeatRuns.createdAt,
-      })
+      .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionIdAfter, sessionId)))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getSessionOriginTaskKey(agentId: string, sessionId: string) {
+    const originRun = await getOldestRunForSession(agentId, sessionId);
+    return originRun ? runTaskKey(originRun) : null;
   }
 
   async function resolveNormalizedUsageForSession(input: {
@@ -1069,6 +1071,9 @@ export function heartbeatService(db: Db) {
     // Guard against detached timer wakes inheriting the last issue-scoped session
     // after the control plane has already cleared task ownership.
     if (!taskKey) {
+      const sessionOriginTaskKey = await getSessionOriginTaskKey(agent.id, runtimeSessionId);
+      if (sessionOriginTaskKey) return null;
+
       const lastRunId = readNonEmptyString(runtimeForRun?.lastRunId);
       if (!lastRunId) return null;
       const lastRun = await getRun(lastRunId);
@@ -1663,6 +1668,129 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  async function enqueueTimedOutIssueRecovery(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = deriveTaskKey(contextSnapshot, null);
+    if (!issueId || !taskKey) return null;
+
+    const taskSession = await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey);
+    const sessionOverride = buildExplicitResumeSessionOverride({
+      resumeFromRunId: run.id,
+      resumeRunSessionIdBefore: run.sessionIdBefore,
+      resumeRunSessionIdAfter: run.sessionIdAfter,
+      taskSession,
+      sessionCodec: getAdapterSessionCodec(agent.adapterType),
+    });
+    const retryContextSnapshot: Record<string, unknown> = {
+      ...contextSnapshot,
+      retryOfRunId: run.id,
+      wakeReason: "retry_failed_run",
+      retryReason: "timeout",
+    };
+    if (sessionOverride) {
+      retryContextSnapshot.resumeFromRunId = run.id;
+      retryContextSnapshot.resumeSessionDisplayId = sessionOverride.sessionDisplayId;
+      retryContextSnapshot.resumeSessionParams = sessionOverride.sessionParams;
+    }
+
+    const queued = await db.transaction(async (tx) => {
+      const wakeupPayload: Record<string, unknown> = {
+        issueId,
+        retryOfRunId: run.id,
+      };
+      if (taskKey !== issueId) {
+        wakeupPayload.taskId = readNonEmptyString(contextSnapshot.taskId) ?? taskKey;
+        wakeupPayload.taskKey = taskKey;
+      }
+      if (sessionOverride) {
+        wakeupPayload.resumeFromRunId = run.id;
+      }
+
+      const wakeupRequest = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "retry_failed_run",
+          payload: wakeupPayload,
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const retryRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeupRequest.id,
+          contextSnapshot: retryContextSnapshot,
+          sessionIdBefore: sessionOverride?.sessionDisplayId ?? null,
+          retryOfRunId: run.id,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          runId: retryRun.id,
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: retryRun.id,
+          executionAgentNameKey: normalizeAgentNameKey(agent.name),
+          executionLockedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+
+      return retryRun;
+    });
+
+    publishLiveEvent({
+      companyId: queued.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.id,
+        agentId: queued.agentId,
+        invocationSource: queued.invocationSource,
+        triggerDetail: queued.triggerDetail,
+        wakeupRequestId: queued.wakeupRequestId,
+      },
+    });
+
+    await appendRunEvent(queued, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Queued automatic retry after detached child exceeded the timeout budget",
+      payload: {
+        retryOfRunId: run.id,
+      },
+    });
+
+    return queued;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -1845,6 +1973,10 @@ export function heartbeatService(db: Db) {
             },
           });
 
+          const agent = await getAgent(run.agentId);
+          if (agent) {
+            await enqueueTimedOutIssueRecovery(finalizedRun, agent, now);
+          }
           await releaseIssueExecutionAndPromote(finalizedRun);
           await finalizeAgentStatus(run.agentId, "timed_out");
           await startNextQueuedRunForAgent(run.agentId);

@@ -14,6 +14,7 @@ import {
   agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companySkills,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -112,12 +113,14 @@ describe("heartbeat orphaned process recovery", () => {
       child.kill("SIGKILL");
     }
     childProcesses.clear();
+    await new Promise((resolve) => setTimeout(resolve, 100));
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentRuntimeState);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
@@ -288,9 +291,101 @@ describe("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBeNull();
-    expect(issue?.executionLockedAt).toBeNull();
+    expect(issue?.executionRunId).toBeTruthy();
+    expect(issue?.executionLockedAt).toBeTruthy();
     expect(issue?.checkoutRunId).toBe(runId);
+
+    const queuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, run!.agentId));
+    expect(queuedRuns).toHaveLength(2);
+
+    const retryRun = queuedRuns.find((row) => row.id !== runId);
+    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.retryOfRunId).toBe(runId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryOfRunId: runId,
+      wakeReason: "retry_failed_run",
+      retryReason: "timeout",
+    });
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+  });
+
+  it("queues issue-specific timeout recovery even when an older generic timer wake is already queued", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      processStartedAt: new Date("2026-03-19T00:00:00.000Z"),
+      adapterConfig: {
+        timeoutSec: 60,
+        graceSec: 5,
+      },
+    });
+    const genericWakeupRequestId = randomUUID();
+    const genericRunId = randomUUID();
+    const queuedAt = new Date("2026-03-18T23:55:00.000Z");
+
+    await db.insert(agentWakeupRequests).values({
+      id: genericWakeupRequestId,
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      payload: {},
+      status: "queued",
+      runId: genericRunId,
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      requestedAt: queuedAt,
+      updatedAt: queuedAt,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: genericRunId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: genericWakeupRequestId,
+      contextSnapshot: {},
+      createdAt: queuedAt,
+      updatedAt: queuedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(3);
+
+    const timeoutRecoveryRun = runs.find((row) => row.retryOfRunId === runId);
+    expect(timeoutRecoveryRun?.status).toBe("queued");
+    expect(timeoutRecoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryOfRunId: runId,
+      wakeReason: "retry_failed_run",
+      retryReason: "timeout",
+    });
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBe(timeoutRecoveryRun?.id ?? null);
+    expect(issue?.executionRunId).not.toBe(genericRunId);
   });
 
   it("times out a detached no-issue timer run after it exceeds the configured timeout budget", async () => {
@@ -472,6 +567,127 @@ describe("heartbeat orphaned process recovery", () => {
       adapterType: "codex_local",
       sessionId,
       lastRunId: previousRunId,
+      stateJson: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      contextSnapshot: {
+        source: "scheduler",
+        reason: "interval_elapsed",
+        now: now.toISOString(),
+      },
+    });
+
+    expect(run).toBeTruthy();
+    expect(run?.sessionIdBefore).toBeNull();
+  });
+
+  it("does not reuse a no-task runtime session when the session origin run was issue-scoped", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueRunId = randomUUID();
+    const issueWakeupRequestId = randomUUID();
+    const globalRunId = randomUUID();
+    const globalWakeupRequestId = randomUUID();
+    const issueId = randomUUID();
+    const sessionId = "session-task-promoted-global-1";
+    const now = new Date("2026-03-19T00:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: issueWakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "completed",
+      runId: issueRunId,
+      claimedAt: now,
+      finishedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: issueRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      wakeupRequestId: issueWakeupRequestId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+      },
+      sessionIdAfter: sessionId,
+      startedAt: now,
+      finishedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: globalWakeupRequestId,
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      payload: {},
+      status: "completed",
+      runId: globalRunId,
+      claimedAt: now,
+      finishedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: globalRunId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      triggerDetail: "system",
+      status: "succeeded",
+      wakeupRequestId: globalWakeupRequestId,
+      contextSnapshot: {},
+      sessionIdBefore: sessionId,
+      sessionIdAfter: sessionId,
+      startedAt: now,
+      finishedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "codex_local",
+      sessionId,
+      lastRunId: globalRunId,
       stateJson: {},
     });
 
