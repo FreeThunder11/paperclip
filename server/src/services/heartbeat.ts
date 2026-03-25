@@ -695,7 +695,7 @@ export function resolveQueuedNoTaskSessionFallback(input: {
   taskKey: string | null;
   resetTaskSession: boolean;
   runSessionIdBefore: string | null;
-  fallbackSessionOriginTaskKey: string | null;
+  fallbackSessionSourceTaskKey: string | null;
 }) {
   if (input.taskKey || input.resetTaskSession) {
     return { sessionId: null, warning: null };
@@ -706,12 +706,12 @@ export function resolveQueuedNoTaskSessionFallback(input: {
     return { sessionId: null, warning: null };
   }
 
-  if (input.fallbackSessionOriginTaskKey) {
+  if (input.fallbackSessionSourceTaskKey) {
     return {
       sessionId: null,
       warning:
         `Skipping queued no-task session fallback "${truncateDisplayId(sessionId)}" ` +
-        `because it originated from task "${input.fallbackSessionOriginTaskKey}".`,
+        `because it originated from task "${input.fallbackSessionSourceTaskKey}".`,
     };
   }
 
@@ -2478,15 +2478,17 @@ export function heartbeatService(db: Db) {
     const runtimeSessionParams = runtimeSessionResolution.sessionParams;
     const queuedNoTaskSessionId =
       !taskKey && !resetTaskSession ? readNonEmptyString(run.sessionIdBefore) : null;
-    const queuedNoTaskSessionOriginTaskKey =
+    const queuedNoTaskSessionSourceRun =
       queuedNoTaskSessionId
-        ? await getSessionOriginTaskKey(agent.id, queuedNoTaskSessionId)
+        ? await getLatestRunForSession(agent.id, queuedNoTaskSessionId, { excludeRunId: run.id })
         : null;
     const queuedNoTaskSessionFallback = resolveQueuedNoTaskSessionFallback({
       taskKey,
       resetTaskSession,
       runSessionIdBefore: queuedNoTaskSessionId,
-      fallbackSessionOriginTaskKey: queuedNoTaskSessionOriginTaskKey,
+      fallbackSessionSourceTaskKey: queuedNoTaskSessionSourceRun
+        ? runTaskKey(queuedNoTaskSessionSourceRun)
+        : null,
     });
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
